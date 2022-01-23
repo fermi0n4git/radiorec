@@ -31,7 +31,7 @@ import logging
 import time
 from urllib3.exceptions import MaxRetryError
 logging.basicConfig(level=logging.DEBUG)
-
+from joblib import Parallel, delayed
 
 def print_time():
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -51,19 +51,8 @@ def check_duration(value):
         return value
 
 
-def read_settings(args):
+def read_settings():
     settings_base_dir = ''
-    if args.settings:
-        settings_base_dir = args.settings
-    elif sys.platform.startswith('linux'):
-        settings_base_dir = os.getenv(
-            'HOME') + os.sep + '.config' + os.sep + 'radiorec'
-    elif sys.platform == 'win32':
-        settings_base_dir = os.getenv('LOCALAPPDATA') + os.sep + 'radiorec'
-    elif sys.platform == 'darwin':
-        settings_base_dir = os.getenv('HOME') + os.sep + 'Library' + os.sep + \
-                            'Application Support' + os.sep + 'radiorec'
-    settings_base_dir += os.sep
     config = configparser.ConfigParser()
     try:
         config.read_file(open(settings_base_dir + 'settings.ini'))
@@ -74,7 +63,7 @@ def read_settings(args):
     return dict(config.items())
 
 
-def record_worker(stoprec, streamurl, target_dir, args):
+def record_worker(stoprec, streamurl, target_dir, station_name):
     pool = urllib3.PoolManager()
     conn = pool.request('GET', streamurl, preload_content=False)
     conn.auto_close = False
@@ -85,9 +74,7 @@ def record_worker(stoprec, streamurl, target_dir, args):
         return
 
     cur_dt_string = datetime.datetime.now().strftime('%Y-%m-%dT%H_%M_%S')
-    filename = target_dir + os.sep + cur_dt_string + "_" + args.station
-    if args.name:
-        filename += '_' + args.name
+    filename = target_dir + os.sep + cur_dt_string + "_" + station_name
     content_type = conn.getheader('Content-Type')
     if (content_type == 'audio/mpeg'):
         filename += '.mp3'
@@ -102,19 +89,17 @@ def record_worker(stoprec, streamurl, target_dir, args):
         print('Unknown content type "' + content_type + '". Assuming mp3.')
         filename += '.mp3'
 
-    verboseprint(print_time() + " ... Writing to: " + filename + ", Content-Type: " + conn.getheader('Content-Type'))
+    print(print_time() + " ... Writing to: " + filename + ", Content-Type: " + conn.getheader('Content-Type'))
     with open(filename, 'wb') as target:
-        if args.public:
-            verboseprint('Apply public write permissions (Linux only)')
-            os.chmod(filename, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP | stat.S_IROTH | stat.S_IWOTH)
+        os.chmod(filename, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP | stat.S_IROTH | stat.S_IWOTH)
         while(not stoprec.is_set() and not conn.closed):
             target.write(conn.read(1024))
 
-    verboseprint(print_time() + " ... Connection closed = " + str(conn.closed))
+    print(print_time() + " ... Connection closed = " + str(conn.closed))
     conn.release_conn()
 
 
-def record(args):
+def record_origin(args):
     settings = read_settings(args)
     streamurl = ''
     tmpstr = ''
@@ -185,13 +170,9 @@ def record(args):
                      ", Threads: " + str(threading.activeCount()))
 
 
-def list(args):
-    settings = read_settings(args)
-    for key in sorted(settings['STATIONS']):
-        print(key)
 
 
-def main():
+def main_origin():
     parser = argparse.ArgumentParser(description='This program records internet radio streams. '
                                                  'It is free software and comes with ABSOLUTELY NO WARRANTY.')
     subparsers = parser.add_subparsers(help='sub-command help')
@@ -223,6 +204,88 @@ def main():
         sys.exit(1)
     args = parser.parse_args()
     args.func(args)
+
+def record(station_name, streamurl, target_dir, duration):
+    tmpstr = ''
+
+    if streamurl.endswith('.m3u'):
+        print('Seems to be an M3U playlist. Trying to parse...')
+        pool = urllib3.PoolManager()
+        try:
+            remotefile = pool.request('GET', streamurl)
+        except MaxRetryError:
+            logging.getLogger(__name__).error('The URL of the station is somehow faulty! Check' +
+                                              streamurl + ' in the Settings!')
+            sys.exit()
+        if remotefile.status != 200:
+            logging.getLogger(__name__).error(
+                'The URL of the station is somehow faulty! Check' + streamurl + ' in the Settings!')
+            sys.exit(1)
+        else:
+            for line in remotefile.data.decode().split():
+                if not line.startswith('#') and len(line) > 1 and line.endswith('mp3'):
+                    tmpstr = line
+                    break
+        if not tmpstr:
+            logging.getLogger(__name__).error('Could not find a mp3 stream')
+            sys.exit(1)
+        else:
+            streamurl = tmpstr
+
+    print(print_time() + " ... Stream URL: " + streamurl)
+    target_dir = os.path.expandvars(target_dir)
+    if not os.path.isdir(target_dir):
+        try:
+            os.mkdir(target_dir)
+        except FileNotFoundError:
+            logging.getLogger(__name__).error('Target directory not found! Check that ' +
+                                              target_dir + ' is a valid folder!')
+            sys.exit(1)
+    started_at = time.time()
+    should_end_at = started_at + (duration * 60)
+    remaining = (duration * 60)
+
+    # as long as recording is supposed to run
+    while time.time() < should_end_at:
+        stoprec = threading.Event()
+        recthread = threading.Thread(target=record_worker, args=(stoprec, streamurl, target_dir, station_name))
+        recthread.setDaemon(True)
+        recthread.start()
+        print(print_time() + " ... Started thread " + str(recthread) + " timeout: " +
+                     str(remaining / 60) + " min")
+        recthread.join(remaining)
+        print(print_time() + " ... Came out of rec thread again")
+
+        if recthread.is_alive:
+            stoprec.set()
+            print(print_time() + " ... Called stoprec.set()")
+        else:
+            print(print_time() + " ... recthread.is_alive = False")
+
+        remaining = should_end_at - time.time()
+        print(print_time() + " ... Remaining: " + str(remaining / 60) +
+                     ", Threads: " + str(threading.activeCount()))
+
+
+def main():
+    settings = read_settings()
+    stations = settings['STATIONS']
+    target_dir = settings['GLOBAL']['target_dir']
+    iterations = int(settings['GLOBAL']['recording_iterations'])
+    duration = int(settings['GLOBAL']['recording_duration'])
+    num_stations = len(stations)
+
+    stations_list = list(stations.items())
+    for i in range(iterations):
+        new_list = list(stations.items())
+        stations_list.extend(new_list)
+
+
+    #record('eldo', url, target_dir, duration)
+    #for st_name, st_url in stations_list:
+    #    record(st_name, st_url, target_dir, duration)
+    Parallel(n_jobs=num_stations)(delayed(record)(st_name, st_url, target_dir, duration) for st_name, st_url in stations_list)
+
 
 
 if __name__ == '__main__':
